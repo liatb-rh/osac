@@ -6,12 +6,7 @@ import { ProjectCreateValues } from './values';
  * See PrivateProjectsServer.Create — metadata.project must be empty or match that prefix.
  */
 export const getCreateProjectPayload = (values: ProjectCreateValues) => {
-  const leafName = values.metadata.name.trim();
-  const parent =
-    !values.metadata.project || values.metadata.project === 'default'
-      ? ''
-      : values.metadata.project;
-  const name = parent ? `${parent}.${leafName}` : leafName;
+  const name = values.metadata.project ? `${values.metadata.project}.${values.metadata.name}` : values.metadata.name;
 
   return {
     metadata: {
