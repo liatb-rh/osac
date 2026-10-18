@@ -72,31 +72,17 @@ ginkgo run --timeout 20m -r internal # All unit suites. Slow, run only when nece
 
 ### Integration tests
 
-Integration tests run in a local Kind Kubernetes cluster. The installer test
-target builds, loads, and deploys the current service image.
+Integration tests run in a local Kind Kubernetes cluster; the installer builds and deploys current images.
 
 See the [fulfillment-service test tiers and coverage notes](../docs/INTEGRATION-TESTING.md#fulfillment-service).
 
-It reuses the existing cluster and database. For a full suite run, use a fresh
-environment unless the user agrees to reuse the database. See `README.md` for
-prerequisites and host entries.
-
-The `it/` suite includes CLI workflows that exercise only Fulfillment Service
-APIs. Its harness builds the CLI from this checkout and runs it against the
-deployed service. Catalog Item API behavior, CLI creation, and the ClusterOrder
-release image written by Fulfillment are checked in `it/`. Keep cross-component
-provisioning journeys under `tests/e2e/`.
-
-The MCP SDK spec in `it/` starts its HTTP handler in-process and calls the
-deployed public Fulfillment API with each user's API token supplied by a test
-exchanger. It covers public API authorization and persistence. The focused
-deployed MCP spec runs in the Fulfillment Kind CI job: it uses the public MCP
-client's PKCE flow, calls the deployed HTTPS listener, and checks that a
-Fulfillment API token is rejected. Unit tests cover exchange edge cases; chart
-renders cover the opt-in deployment shape.
-
-To prepare a fresh environment, recreate the dedicated `osac-dev` Kind
-cluster. Collect useful diagnostics before deleting it.
+FabricDomain API authorization, tenant filtering, CRUD persistence, and cleanup
+are component-integration coverage in
+[`it/it_fabric_domain_tenant_api_test.go`](it/it_fabric_domain_tenant_api_test.go).
+Run it through the `SUITE=fulfillment` installer target; that stage deploys the
+service and database with the operator disabled, so it does not exercise Netris
+or AAP. The complete provider lifecycle belongs to the BMaaS E2E coverage in
+OSAC-4786.
 
 ```bash
 export KUBECONFIG="$HOME/.kube/osac-dev-kind.kubeconfig"

@@ -104,7 +104,7 @@ func newClusterOrderFeedbackBridge(hubClient clnt.Client, clustersClient private
 			_, err := clustersClient.Update(ctx, privatev1.ClustersUpdateRequest_builder{
 				Object: remote,
 				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{
-					"status.conditions", feedbackStatusStatePath, "status.api_url", "status.console_url", "status.api_endpoint",
+					feedbackStatusConditionsPath, feedbackStatusStatePath, "status.api_url", "status.console_url", "status.api_endpoint",
 					"status.ingress_endpoint", feedbackStatusStateTransitionTimePath, "status.kubeconfig_secret", "status.password_secret", "status.hub",
 					"status.node_sets", "status.add_on_operators",
 				}},
@@ -466,17 +466,14 @@ func setWorkerCondition(remote *privatev1.Cluster, condType privatev1.ClusterCon
 }
 
 func buildWorkerFailedMessage(workers []ckv1alpha1.WorkerStatus, desired int32) string {
-	var failed, retrying int32
+	var failed int32
 	for i := range workers {
 		if workers[i].Phase == "Failed" {
 			failed++
-			if workers[i].NextRetryTime != nil {
-				retrying++
-			}
 		}
 	}
 	msg := fmt.Sprintf("%d of %d worker nodes failed to provision", failed, desired)
-	if retrying > 0 {
+	if failed > 0 {
 		msg += "; " + baremetalworker.FormatWorkersFailed(workers)
 	}
 	return msg
