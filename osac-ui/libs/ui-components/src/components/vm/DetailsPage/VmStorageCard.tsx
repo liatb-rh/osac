@@ -4,7 +4,7 @@ import { Table, Tbody, Td, Th, Thead, Tr } from '@patternfly/react-table';
 import type { ComputeInstance } from '@osac/types';
 
 import { useTranslation } from '../../../hooks/useTranslation';
-import { getVmStorageRows } from '../../catalogProvision/wizard/storageRows';
+import { getVmStorageRows } from '../../ProvisioningWizard/storageRows';
 
 interface VmStorageCardProps {
   vm: ComputeInstance;
@@ -12,7 +12,7 @@ interface VmStorageCardProps {
 
 const VmStorageCard = ({ vm }: VmStorageCardProps) => {
   const { t } = useTranslation();
-  const storageRows = getVmStorageRows(t, vm.spec?.bootDisk, vm.spec?.additionalDisks);
+  const storageRows = getVmStorageRows(t, vm.spec?.bootDisk, vm.spec?.additionalDisks?.items);
 
   return (
     <Card isFullHeight>

@@ -3,6 +3,7 @@ set -e
 
 # Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export KUBECONFIG="${SCRIPT_DIR}/kubeconfig-osac-test"
 
 echo "=== Setting up test environment ==="
 
@@ -66,6 +67,18 @@ kubectl wait --for=delete pod --all -n cdi --timeout=60s 2>/dev/null || echo "So
 # breaks cluster-wide discovery and can wedge any later namespace delete forever.
 echo "Removing stale KubeVirt/CDI APIServices to keep namespace discovery healthy..."
 kubectl delete apiservice v1.subresources.kubevirt.io v1alpha3.subresources.kubevirt.io v1beta1.upload.cdi.kubevirt.io --ignore-not-found 2>/dev/null || echo "Could not remove one or more stale APIServices"
+
+# Scaled-to-0 virt-api also leaves MutatingWebhookConfigurations and
+# ValidatingWebhookConfigurations pointing at the unreachable
+# virt-api.kubevirt.svc service.  Any VMI or DataVolume creation
+# hits these stale webhooks and gets HTTP 500 "connection refused".
+# Remove them so tests can create synthetic VMI fixtures directly.
+# Only KubeVirt/CDI register webhooks on this dedicated Kind
+# cluster, so --all is safe and avoids hard-coding version-specific
+# webhook configuration names.
+echo "Removing stale KubeVirt/CDI admission webhooks (virt-api is scaled down)..."
+kubectl delete mutatingwebhookconfigurations --all --ignore-not-found 2>/dev/null || echo "Could not remove one or more mutating webhook configurations"
+kubectl delete validatingwebhookconfigurations --all --ignore-not-found 2>/dev/null || echo "Could not remove one or more validating webhook configurations"
 
 echo "KubeVirt and CDI deployments scaled down. CRs and CRDs remain available for testing."
 

@@ -1,6 +1,6 @@
 # Installing OSAC on OpenShift Container Platform (WIP)
 
-**Last Updated**: 2026-09-16
+**Last Updated**: 2026-10-23
 **Audience**: Cloud administrators
 **Status**: WIP — see the TBD notes in [Section 6.2](#62-installing-osac-for-caas-with-the-netris-network-backend)
 and [Section 8.3](#83-registering-the-hub) for what's still open
@@ -254,6 +254,8 @@ Required for BMaaS with the Metal3 backend:
 - **CaaS** (`global.services.caas.enabled`) requires multicluster engine
   (standalone, or provided by RHACM if it's installed), a DNS backend, a
   network backend, and `aap.instanceGroups.clusterFulfillment` configuration.
+  Hosted control planes provision etcd persistent volume claims from the
+  hub's default storage class (see [Section 2.1](#21-cluster-and-access)).
   For more information,
   see
   [`aap-configuration.md`](https://github.com/osac-project/osac/blob/main/osac-installer/docs/aap-configuration.md).
@@ -471,7 +473,7 @@ subchart's own `values.yaml` file.
 | Parameter | Source | Description | Default |
 |---|---|---|---|
 | `global.clusterDomain` | schema | Apps domain. All route host names and the default issuer, IdP, and Vault URLs derive from it. Set at installation. | `""` |
-| `global.osacDeploymentId` | schema | Required when `metering.enabled` is `true`. A stable identity for this deployment, stored in a retained `ConfigMap`. The chart fails to render without it when metering is on, and fails on upgrade if the value changes — never change it after the first successful install. | Not set |
+| `global.osacDeploymentId` | schema | Required. A stable identity for this deployment, stored in a retained `ConfigMap`. The chart fails to render without it, and fails on upgrade if the value changes — never change it after the first successful install. | Not set |
 | `global.services.vmaas.enabled` | schema | Enables the VMaaS tier. | `true` |
 | `global.services.caas.enabled` | schema | Enables the CaaS tier. | `true` |
 | `global.services.bmaas.enabled` | schema | Enables the BMaaS tier and gates the `bmf` subchart. | `true` |
@@ -539,7 +541,7 @@ subchart's own `values.yaml` file.
 | `aap.instanceGroups.clusterFulfillment.enabled`, `aap.instanceGroups.clusterFulfillment.config`, `aap.instanceGroups.clusterFulfillment.secret` | The `cluster-fulfillment` instance group for CaaS provisioning. See [Section 6.2](#62-installing-osac-for-caas-with-the-netris-network-backend). |
 | `aap.instanceGroups.networkFulfillment.enabled`, `aap.instanceGroups.networkFulfillment.config`, `aap.instanceGroups.networkFulfillment.secret` | The `network-fulfillment` instance group for Netris. See [Section 6.2](#62-installing-osac-for-caas-with-the-netris-network-backend). |
 | `aap.instanceGroups.storageFulfillment.config.STORAGE_SNAPSHOTS_ENABLED` | Snapshot toggle for the `storage-operations` instance group. |
-| `aap.instanceGroups.publishTemplates.enabled` | Runs the postinstallation `osac-publish-templates` hook. Default `true`. Set it to `false` for VMaaS-only or BMaaS-only installations. |
+| `aap.instanceGroups.publishTemplates.enabled` | Runs the postinstallation `osac-publish-templates` hook, which publishes cluster templates (CaaS, MaaS), compute instance templates (VMaaS), bare-metal instance templates, and add-on operators (CaaS) to the fulfillment catalog. Default `true`. Set to `false` only when no enabled service depends on hook-published templates — currently a BMaaS-only deployment — or when all required templates are provisioned separately. |
 | `aap.instanceGroups.publishTemplates.config.OSAC_TEMPLATE_COLLECTIONS`, `aap.instanceGroups.publishTemplates.config.OSAC_FULFILLMENT_SERVICE_URI` | The Ansible collections to publish and the internal Fulfillment Service URI. |
 
 **Table 5.6. Web console, BMaaS, and other parameters**
@@ -559,8 +561,8 @@ subchart's own `values.yaml` file.
 | `operatorCrds.install` | schema | Install the OSAC CRDs. Set it to `false` if a cluster administrator manages them. | `true` |
 | `kafka.enabled` | schema | Creates the Fulfillment Service's Strimzi user and copies its credentials. Set to `false` for an external Kafka connection; this does not disable Kafka use or metering's Strimzi resources. See [Kafka configuration](kafka-configuration.md). | `true` |
 | `service.kafka.connection` | schema | ConfigMap/Secret mappings for the required `brokers`, `user`, and `password` parameters. Supply resources in the OSAC namespace. | `fulfillment-service-kafka` Secret |
-| `metering.enabled` | schema | Deploys the metering service. Requires Strimzi-managed Kafka, a database connection, and `global.osacDeploymentId` (see [Table 5.1](#table-51-service-enablement-my-valuesyaml) and [Kafka configuration](kafka-configuration.md#optional-metering)). | `false` |
-| `metering.reconciliation.interval`, `metering.m360Adapter.enabled`, `metering.m360Adapter.m360.apiUrl`, `metering.m360Adapter.apiKeySecret` | subchart | Reconcile period and the Monetize360 billing adapter. | Not applicable |
+| `metering.database.connection` | schema | Metering service database connection. The metering service is always deployed: billing is not optional, and the event publisher writes usage events unconditionally. Requires Strimzi-managed Kafka, a database connection, and `global.osacDeploymentId` (see [Table 5.1](#table-51-service-enablement-my-valuesyaml) and [Kafka configuration](kafka-configuration.md#metering)). | Secret-based default |
+| `metering.heartbeat.interval`, `metering.m360Adapter.enabled`, `metering.m360Adapter.m360.apiUrl`, `metering.m360Adapter.apiKeySecret` | subchart | Heartbeat round interval and the Monetize360 billing adapter. | Not applicable |
 | `validation.enabled` | schema | Runs the pre-installation validation hook. | `true` |
 | `metallb.enabled`, `metallb.addressCIDR` | schema | In the `osac` chart, creates an `IPAddressPool` and an `L2Advertisement`. Edit the pool after installation to match your network. | `false` and `192.168.40.0/24` |
 | `bundledVault.enabled`, `bundledVault.image` | schema | In-cluster OpenBao for testing and CI. Not intended for production. | `true` and `openbao:2.6.2` |
@@ -628,8 +630,12 @@ the cluster. Then follow [Section 4](#4-installing-osac).
    aap:
      instanceGroups:
        publishTemplates:
-         enabled: false
+         enabled: true
    ```
+
+   The `publishTemplates` hook publishes the compute instance
+   templates that VMaaS needs. Disable it only if the required
+   templates are provisioned separately.
 
    `lvms: { enabled: true }` runs the `osac` chart's `register-local-storage`
    hook, which creates the `local` `StorageBackend` and `StorageTier` that the
@@ -653,16 +659,6 @@ the cluster. Then follow [Section 4](#4-installing-osac).
 
 ### 6.2 Installing OSAC for CaaS with the Netris network backend
 
-> **TBD**
->
-> `network-backend.md` now documents a `global.networking` facade
-> (`fabricManager`/`k8sManager`) that Helm derives the AAP instance-group
-> config from, and a supported `agentless_net` backend this section doesn't
-> cover. This section still uses the older, direct
-> `aap.instanceGroups.clusterFulfillment.config` style. Pending confirmation
-> from the networking team (see the open PR discussion) before rewriting it
-> around the facade.
-
 The AWS Route 53 DNS backend is the default; it's independent of the network
 backend. For the full variable reference, see
 [`network-backend.md`](https://github.com/osac-project/osac/blob/main/osac-installer/docs/network-backend.md).
@@ -670,12 +666,17 @@ backend. For the full variable reference, see
 **Prerequisites**
 
 - multicluster engine is installed (standalone, or provided by RHACM).
-- MetalLB (or another `LoadBalancer`-class implementation) and LVM Storage
-  (or another dynamic storage class) are installed.
+- MetalLB (or another `LoadBalancer`-class implementation) is installed.
+- The hub cluster has a default storage class (see
+  [Section 2.1](#21-cluster-and-access)). Hosted control planes provision
+  etcd persistent volume claims from it.
 - You have AWS Route 53 credentials for the target hosted zone.
 - Access to the Netris controller: URL, user name, password, site and tenant
   IDs, and management VPC details.
 - SSH private keys for the servers and the bastion host.
+
+> **Note**: OSAC-managed storage tiers are not yet available for CaaS tenant
+> clusters. The tenant-cluster CSI storage provider is under development.
 
 **Procedure**
 
@@ -686,6 +687,19 @@ backend. For the full variable reference, see
    ```yaml
    global:
      services: { caas: { enabled: true }, vmaas: { enabled: false }, bmaas: { enabled: false }, maas: { enabled: false } }
+     networking:
+       fabricManager: netris
+       k8sManager: ""
+       netris:
+         controllerUrl: "https://netris.example.com"
+         credentials:
+           username: "netris"
+         siteId: "5"
+         tenantId: "1"
+         tenantName: "Admin"
+         mgmtVpcId: "4"
+         mgmtVpcName: "RH-Infra"
+         resourceClassMap: '{"fc430":{"server_cluster_template_id":89,"mgmt_interface":"ens4","vpc_interfaces":["ens13"]}}'
    clusterVersions:
      enabled: true
      versions:
@@ -699,17 +713,7 @@ backend. For the full variable reference, see
        clusterFulfillment:
          enabled: true
          config:
-           NETWORK_CLASS: "netris"
-           NETWORK_STEPS_COLLECTION: "netris.steps"
            DNS_CLASS: "dns.route53.dns"
-           NETRIS_CONTROLLER_URL: "https://netris.example.com"
-           NETRIS_USERNAME: "netris"
-           NETRIS_SITE_ID: "5"
-           NETRIS_TENANT_ID: "1"
-           NETRIS_TENANT_NAME: "Admin"
-           NETRIS_MGMT_VPC_ID: "4"
-           NETRIS_MGMT_VPC_NAME: "RH-Infra"
-           NETRIS_RESOURCE_CLASS_MAP: '{"fc430":{"server_cluster_template_id":89,"mgmt_interface":"ens4","vpc_interfaces":["ens13"]}}'
            SERVER_SSH_BASTION_HOST: "bastion.example.com"
            SERVER_SSH_BASTION_USER: "ubuntu"
            SERVER_SSH_USER: "core"
@@ -723,15 +727,9 @@ backend. For the full variable reference, see
            HOSTED_CLUSTER_INFRASTRUCTURE_AVAILABILITY_POLICY: "HighlyAvailable"
        networkFulfillment:
          enabled: true
-         config:
-           NETRIS_CONTROLLER_URL: "https://netris.example.com"
-           NETRIS_USERNAME: "netris"
-           NETRIS_SITE_ID: "5"
-           NETRIS_TENANT_ID: "1"
-           NETRIS_TENANT_NAME: "Admin"
    ```
 
-   In `NETRIS_RESOURCE_CLASS_MAP`, each key is a resource-class name;
+   In `global.networking.netris.resourceClassMap`, each key is a resource-class name;
    `server_cluster_template_id` is the Netris server-cluster template,
    `mgmt_interface` is the management NIC, and `vpc_interfaces` are the
    data-plane NICs.
@@ -740,37 +738,24 @@ backend. For the full variable reference, see
    excluded from version control:
 
    ```yaml
+   global:
+     networking:
+       netris:
+         credentials:
+           password: "<netris_password>"
    aap:
      instanceGroups:
        clusterFulfillment:
          secret:
-           NETRIS_PASSWORD: "<netris_password>"
            AWS_ACCESS_KEY_ID: "<route53_access_key_id>"
            AWS_SECRET_ACCESS_KEY: "<route53_secret_access_key>"
            SERVER_SSH_KEY: |
              <contents_of_your_openssh_private_key_file>
            SERVER_SSH_BASTION_KEY: |
              <contents_of_your_openssh_bastion_private_key_file>
-       networkFulfillment:
-         secret:
-           NETRIS_PASSWORD: "<netris_password>"
    ```
 
-3. Register the `netris` fabric manager and point the default `NetworkClass` at
-   it:
-
-   ```yaml
-   networkManagers:
-     - name: netris
-       role: fabric
-       description: "Netris SDN fabric manager"
-       capabilities: "ipv4"
-   networkClass:
-     fabricManager: "netris"
-     k8sManager: ""
-   ```
-
-4. Install OSAC (see [Section 4.3](#43-installing-osac)), passing every
+3. Install OSAC (see [Section 4.3](#43-installing-osac)), passing every
    values file, for example `helm ... -f my-values.yaml -f my-secrets.local.yaml
    ...`. For more information, see
    [`aap-configuration.md`](https://github.com/osac-project/osac/blob/main/osac-installer/docs/aap-configuration.md)
@@ -816,8 +801,10 @@ backend. For the full variable reference, see
          enabled: false
    ```
 
-   Set `bmf.metal3.namespace` to the namespace where your `BareMetalHost`
-   resources live.
+   Setting `publishTemplates.enabled` to `false` is safe here
+   because a BMaaS-only deployment does not consume templates
+   published by this hook. Set `bmf.metal3.namespace` to the
+   namespace where your `BareMetalHost` resources live.
 
 2. Install OSAC. See [Section 4.3](#43-installing-osac).
 
@@ -913,7 +900,7 @@ passed. If a step fails, see [Section 11](#11-troubleshooting).
      `fulfillment-controller`, `fulfillment-ingress-proxy`, `osac-operator`,
      `osac-operator-console-proxy`, and the `osac-aap-*` pods.
    - With `ui.enabled`: `osac-ui`.
-   - With `metering.enabled`: the `osac-metering` pods.
+   - Always: the `osac-metering` pods.
    - With `bundledVault.enabled`: `openbao-0`.
    - VMaaS: `fulfillment-console-proxy`.
    - BMaaS: the Bare Metal Fulfillment Operator pod.
@@ -1216,7 +1203,8 @@ $ oc logs job/osac-pre-install-validate -n <namespace>
 
   Or set `bmf.metal3.enabled` to `false`.
 - `No default StorageClass found`: this is a warning, not a failure. Keycloak
-  and PostgreSQL persistent volume claims remain `Pending`. Set a default
+  and PostgreSQL persistent volume claims remain `Pending`, and CaaS hosted
+  control planes cannot provision etcd persistent volume claims. Set a default
   storage class. See [Section 2.1](#21-cluster-and-access).
 
 ### 11.2 A Helm release is stuck in `pending-install` or `pending-upgrade`
@@ -1343,12 +1331,16 @@ $ oc logs job/osac-publish-templates -n <namespace> -c wait-for-fulfillment
 $ oc logs job/osac-publish-templates -n <namespace> -c publish-templates
 ```
 
-The hook runs by default, mainly for CaaS. The init container polls the
+The hook publishes cluster templates (CaaS, MaaS), compute instance
+templates (VMaaS), bare-metal instance templates, and add-on operators
+(CaaS) to the fulfillment catalog. The init container polls the
 Fulfillment Service REST gateway for up to 600 seconds. The job then
-launches the `osac-publish-templates` AAP job template and requires a valid
-`osac-aap-api-token` Secret. To disable the hook for VMaaS-only or
-BMaaS-only installations, set `aap.instanceGroups.publishTemplates.enabled`
-to `false`.
+launches the `osac-publish-templates` AAP job template and requires a
+valid `osac-aap-api-token` Secret. Set
+`aap.instanceGroups.publishTemplates.enabled` to `false` only when no
+enabled service depends on hook-published templates — currently a
+BMaaS-only deployment — or when all required templates are provisioned
+separately.
 
 ### 11.10 The `fulfillment-*` pods are in `CrashLoopBackOff`
 

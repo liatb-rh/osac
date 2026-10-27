@@ -289,6 +289,25 @@ var _ = Describe("Event publisher", Ordered, func() {
 			Expect(publisher).To(BeNil())
 		})
 
+		It("Creates with any retention: negative and zero both mean indefinite", func() {
+			// A negative duration is the spelled-out indefinite form, matching
+			// the broker's own retention.ms = -1; the zero duration means it too.
+			for _, retention := range []time.Duration{-time.Second, 0} {
+				publisher, err := NewEventPublisher().
+					SetLogger(logger).
+					SetDatabasePool(&pgxpool.Pool{}).
+					SetKafkaConfig(kafkaConfig).
+					SetKafkaBrokers(kafkaBroker.Brokers()).
+					SetKafkaTopicPrefix("osac.events.").
+					SetKafkaTopicRetention(retention).
+					Build()
+				Expect(err).ToNot(HaveOccurred())
+				Expect(publisher).ToNot(BeNil())
+				Expect(publisher.retentionMS()).To(Equal("-1"))
+				Expect(publisher.Close()).To(Succeed())
+			}
+		})
+
 		It("Can't be created with an empty table", func() {
 			publisher, err := NewEventPublisher().
 				SetLogger(logger).
@@ -968,6 +987,10 @@ var _ = Describe("Event publisher", Ordered, func() {
 							for name, detail := range request.TopicDetails {
 								Expect(detail.NumPartitions).To(Equal(int32(1)))
 								Expect(detail.ReplicationFactor).To(Equal(int16(-1)))
+								Expect(detail.ConfigEntries).To(HaveLen(3))
+								Expect(*detail.ConfigEntries["retention.ms"]).To(Equal("-1"))
+								Expect(*detail.ConfigEntries["retention.bytes"]).To(Equal("-1"))
+								Expect(*detail.ConfigEntries["cleanup.policy"]).To(Equal("delete"))
 								topics = append(topics, name)
 							}
 						}

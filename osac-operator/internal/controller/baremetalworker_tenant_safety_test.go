@@ -82,7 +82,7 @@ var _ = Describe("BareMetalWorker tenant safety", Label("baremetalworker"), func
 			},
 			Spec: osacv1alpha1.ClusterOrderSpec{
 				TemplateID: "test", PullSecret: `{"auths":{}}`, SSHPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5",
-				NodeRequests:      []osacv1alpha1.NodeRequest{{NodeSet: "bm-standard", NumberOfNodes: count, BareMetal: &osacv1alpha1.BareMetalNodeSpec{InstanceType: "bm-standard"}}},
+				NodeRequests:      []osacv1alpha1.NodeRequest{{NodeSet: "bm-standard", NumberOfNodes: count, FabricInterface: "data-0", BareMetal: &osacv1alpha1.BareMetalNodeSpec{InstanceType: "bm-standard"}}},
 				NetworkAttachment: &osacv1alpha1.ClusterNetworkAttachment{SubnetRef: "my-subnet", SecurityGroupRefs: []string{"sg-default"}},
 			},
 		}
@@ -363,13 +363,16 @@ var _ = Describe("BareMetalWorker tenant safety", Label("baremetalworker"), func
 			ready(co.Name)
 			fc.SetCreateError(status.Error(codes.InvalidArgument, "shared template "+reason))
 			_, err := run(co.Name)
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("shared template " + reason))
+			Expect(err).ToNot(HaveOccurred(), "a definitive rejection is a worker failure, not a reconcile error")
+			workers := getOrder(co.Name).Status.Workers
+			Expect(workers).To(HaveLen(1))
+			Expect(workers[0].Phase).To(Equal("Failed"), "template rejection not checkpointed: %+v", workers[0])
+			Expect(workers[0].LastFailureReason).To(Equal("BMICreateRejected"), "template rejection not checkpointed: %+v", workers[0])
+			Expect(workers[0].LastFailureMessage).To(ContainSubstring("shared template "+reason), "template rejection reason lost: %+v", workers[0])
+			Expect(workers[0].BareMetalInstance.ID).To(BeEmpty())
 			Expect(fc.CreateCalls()).To(HaveLen(1))
 			Expect(fc.CreateCalls()[0].GetSpec().GetTemplate().GetShared()).To(BeTrue())
 			Expect(fc.CreateCatalogItemCalls()).To(BeEmpty())
-			Expect(getOrder(co.Name).Status.Workers).To(HaveLen(1))
-			Expect(getOrder(co.Name).Status.Workers[0].BareMetalInstance.ID).To(BeEmpty())
 		})
 	}
 

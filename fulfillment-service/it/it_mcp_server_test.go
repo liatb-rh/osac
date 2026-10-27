@@ -15,10 +15,12 @@ package it
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -40,6 +42,31 @@ import (
 	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
+func keycloakIssuer(ctx context.Context) string {
+	request, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodGet,
+		fmt.Sprintf("https://%s/realms/osac/.well-known/openid-configuration", keycloakAddr),
+		nil,
+	)
+	Expect(err).ToNot(HaveOccurred())
+	transport := &http.Transport{TLSClientConfig: &tls.Config{
+		RootCAs: tool.CaPool().Pool(), MinVersion: tls.VersionTLS12,
+	}}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport}
+	response, err := client.Do(request)
+	Expect(err).ToNot(HaveOccurred())
+	defer response.Body.Close()
+	Expect(response.StatusCode).To(Equal(http.StatusOK))
+	var metadata struct {
+		Issuer string `json:"issuer"`
+	}
+	Expect(json.NewDecoder(response.Body).Decode(&metadata)).To(Succeed())
+	Expect(metadata.Issuer).ToNot(BeEmpty())
+	return metadata.Issuer
+}
+
 var _ = Describe("MCP server", func() {
 	var (
 		ctx                            context.Context
@@ -48,11 +75,11 @@ var _ = Describe("MCP server", func() {
 		computeInstancesClient         publicv1.ComputeInstancesClient
 		diskImagesClient               privatev1.DiskImagesClient
 		instanceTypesClient            privatev1.InstanceTypesClient
+		networkClassesClient           privatev1.NetworkClassesClient
 		storageBackendsClient          privatev1.StorageBackendsClient
 		storageTiersClient             privatev1.StorageTiersClient
 		subnetsClient                  privatev1.SubnetsClient
 		virtualNetworksClient          privatev1.VirtualNetworksClient
-		networkClassesClient           privatev1.NetworkClassesClient
 		securityGroupsClient           privatev1.SecurityGroupsClient
 
 		catalogItemID          string
@@ -73,7 +100,6 @@ var _ = Describe("MCP server", func() {
 	)
 
 	BeforeEach(func() {
-		Skip("OSAC-6371: quarantined – MCP fixture VirtualNetwork READY→PENDING race")
 		ctx = context.Background()
 		catalogItemID, computeInstanceID, otherComputeInstanceID = "", "", ""
 		templateID, diskImageID, instanceTypeID = "", "", ""
@@ -86,11 +112,11 @@ var _ = Describe("MCP server", func() {
 		computeInstancesClient = publicv1.NewComputeInstancesClient(tool.ExternalView().UserConn())
 		diskImagesClient = privatev1.NewDiskImagesClient(adminConn)
 		instanceTypesClient = privatev1.NewInstanceTypesClient(adminConn)
+		networkClassesClient = privatev1.NewNetworkClassesClient(adminConn)
 		storageBackendsClient = privatev1.NewStorageBackendsClient(adminConn)
 		storageTiersClient = privatev1.NewStorageTiersClient(adminConn)
 		subnetsClient = privatev1.NewSubnetsClient(adminConn)
 		virtualNetworksClient = privatev1.NewVirtualNetworksClient(adminConn)
-		networkClassesClient = privatev1.NewNetworkClassesClient(adminConn)
 		securityGroupsClient = privatev1.NewSecurityGroupsClient(adminConn)
 
 		storageBackendResponse, err := storageBackendsClient.Create(ctx, privatev1.StorageBackendsCreateRequest_builder{
@@ -198,10 +224,26 @@ var _ = Describe("MCP server", func() {
 		}.Build())
 		Expect(err).ToNot(HaveOccurred())
 		networkClassID = networkClassResponse.GetObject().GetId()
-		DeferCleanup(func() {
-			_, err := networkClassesClient.Delete(ctx, privatev1.NetworkClassesDeleteRequest_builder{Id: networkClassID}.Build())
-			Expect(err).ToNot(HaveOccurred())
+		DeferCleanup(func(cleanupCtx context.Context) {
+			if securityGroupID != "" {
+				Expect(cleanupSecurityGroupFixture(cleanupCtx, securityGroupsClient, securityGroupID)).To(Succeed())
+			}
+			if subnetID != "" {
+				Expect(cleanupSubnetFixture(cleanupCtx, subnetsClient, subnetID)).To(Succeed())
+			}
+			if virtualNetworkID != "" {
+				Expect(cleanupVirtualNetworkFixture(cleanupCtx, virtualNetworksClient, virtualNetworkID)).To(Succeed())
+			}
+			Expect(cleanupNetworkClassFixture(cleanupCtx, networkClassesClient, networkClassID)).To(Succeed())
 		})
+		waitForNetworkClassReady(ctx, networkClassesClient, networkClassID)
+
+		err = updateNetworkClassStatusWithRetry(ctx, networkClassesClient, networkClassID, privatev1.NetworkClassStatus_builder{
+			State: privatev1.NetworkClassState_NETWORK_CLASS_STATE_READY,
+			Hub:   hubId,
+		}.Build(), &fieldmaskpb.FieldMask{Paths: []string{"status.state", "status.hub"}})
+		Expect(err).ToNot(HaveOccurred())
+		waitForNetworkClassReady(ctx, networkClassesClient, networkClassID)
 
 		virtualNetworkID = fmt.Sprintf("mcp-virtual-network-%s", uuid.New())
 		_, err = virtualNetworksClient.Create(ctx, privatev1.VirtualNetworksCreateRequest_builder{
@@ -219,10 +261,6 @@ var _ = Describe("MCP server", func() {
 			}.Build(),
 		}.Build())
 		Expect(err).ToNot(HaveOccurred())
-		DeferCleanup(func() {
-			_, err := virtualNetworksClient.Delete(ctx, privatev1.VirtualNetworksDeleteRequest_builder{Id: virtualNetworkID}.Build())
-			Expect(err).ToNot(HaveOccurred())
-		})
 		Eventually(func(g Gomega) {
 			response, err := virtualNetworksClient.Get(ctx, privatev1.VirtualNetworksGetRequest_builder{Id: virtualNetworkID}.Build())
 			g.Expect(err).ToNot(HaveOccurred())
@@ -253,10 +291,6 @@ var _ = Describe("MCP server", func() {
 			}.Build(),
 		}.Build())
 		Expect(err).ToNot(HaveOccurred())
-		DeferCleanup(func() {
-			_, err := subnetsClient.Delete(ctx, privatev1.SubnetsDeleteRequest_builder{Id: subnetID}.Build())
-			Expect(err).ToNot(HaveOccurred())
-		})
 		Eventually(func(g Gomega) {
 			response, err := subnetsClient.Get(ctx, privatev1.SubnetsGetRequest_builder{Id: subnetID}.Build())
 			g.Expect(err).ToNot(HaveOccurred())
@@ -285,10 +319,6 @@ var _ = Describe("MCP server", func() {
 		}.Build())
 		Expect(err).ToNot(HaveOccurred())
 		securityGroupID = securityGroupResponse.GetObject().GetId()
-		DeferCleanup(func() {
-			_, err := securityGroupsClient.Delete(ctx, privatev1.SecurityGroupsDeleteRequest_builder{Id: securityGroupID}.Build())
-			Expect(err).ToNot(HaveOccurred())
-		})
 		Eventually(func(g Gomega) {
 			response, err := securityGroupsClient.Get(ctx, privatev1.SecurityGroupsGetRequest_builder{Id: securityGroupID}.Build())
 			g.Expect(err).ToNot(HaveOccurred())
@@ -340,14 +370,16 @@ var _ = Describe("MCP server", func() {
 		jwksCache, err := auth.NewJwksCache().
 			SetLogger(logger).
 			SetCaPool(tool.CaPool()).
-			AddIssuers(fmt.Sprintf("https://%s/realms/osac", keycloakAddr)).
+			AddIssuers(keycloakIssuer(ctx)).
 			Build()
 		Expect(err).ToNot(HaveOccurred())
+		// The password-flow fixture returns Keycloak's account audience. Audience
+		// enforcement is covered by the NewHandler unit tests and the deployed
+		// wrong-audience integration test.
 		jwtValidator, err := auth.NewJwtValidator().
 			SetLogger(logger).
 			SetJwksCache(jwksCache).
 			SetExpirationLeeway(5 * time.Second).
-			AddAudience(auth.Audience).
 			Build()
 		Expect(err).ToNot(HaveOccurred())
 
@@ -390,11 +422,48 @@ var _ = Describe("MCP server", func() {
 		defer func() { Expect(session.Close()).To(Succeed()) }()
 		listedTools, err := session.ListTools(ctx, nil)
 		Expect(err).ToNot(HaveOccurred())
-		Expect(listedTools.Tools).To(HaveLen(4))
+		Expect(listedTools.Tools).To(HaveLen(5))
+		toolNames := make([]string, len(listedTools.Tools))
+		for index, tool := range listedTools.Tools {
+			toolNames[index] = tool.Name
+		}
 		Expect([]string{
 			listedTools.Tools[0].Name, listedTools.Tools[1].Name,
-			listedTools.Tools[2].Name, listedTools.Tools[3].Name,
-		}).To(ConsistOf("list_resources", "get_resource", "create_compute_instance", "delete_compute_instance"))
+			listedTools.Tools[2].Name, listedTools.Tools[3].Name, listedTools.Tools[4].Name,
+		}).To(ConsistOf(
+			"check_connection", "list_resources", "get_resource", "create_compute_instance", "delete_compute_instance",
+		))
+
+		instancesBefore, err := computeInstancesClient.List(ctx, publicv1.ComputeInstancesListRequest_builder{
+			Limit: proto.Int32(1),
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		connection, err := callMCPTool[mcpserver.CheckConnectionOutput](
+			ctx, session, "check_connection", mcpserver.CheckConnectionInput{},
+		)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(connection.Server.Name).To(Equal("osac-deployment-mcp"))
+		Expect(connection.Server.Version).ToNot(BeEmpty())
+		Expect(connection.Caller.Subject).ToNot(BeEmpty())
+		Expect(connection.Caller.Tenants).To(ContainElement(usersGroup))
+		Expect(connection.ResourceFamilies).To(HaveLen(11))
+		Expect(connection.Tools).To(ConsistOf(toolNames))
+		Expect(connection.Permissions).To(ConsistOf(
+			mcpserver.CheckConnectionPermission{
+				Tenant: usersGroup, Service: "osac.public.v1.ComputeInstances", Method: "List", Allowed: true,
+			},
+			mcpserver.CheckConnectionPermission{
+				Tenant: usersGroup, Service: "osac.public.v1.ComputeInstances", Method: "Create", Allowed: true,
+			},
+		))
+		encodedConnection, err := json.Marshal(connection)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(encodedConnection).ToNot(MatchRegexp(`(?i)"(status|conditions?)"`))
+		instancesAfter, err := computeInstancesClient.List(ctx, publicv1.ComputeInstancesListRequest_builder{
+			Limit: proto.Int32(1),
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		Expect(instancesAfter.GetTotal()).To(Equal(instancesBefore.GetTotal()))
 
 		assertDiscoverable := func(resourceType mcpserver.ResourceType, id string) map[string]any {
 			listOutput, err := callMCPTool[mcpserver.ListResourcesOutput](ctx, session, "list_resources", mcpserver.ListResourcesInput{
@@ -460,6 +529,8 @@ var _ = Describe("MCP server", func() {
 		)
 		Expect(err).ToNot(HaveOccurred())
 		Expect(created.ID).ToNot(BeEmpty())
+		Expect(created.Version).To(BeNumerically(">=", 0))
+		Expect(created.State).ToNot(BeEmpty())
 		computeInstanceID = created.ID
 		DeferCleanup(func() {
 			if computeInstanceID == "" {
@@ -532,6 +603,7 @@ var _ = Describe("MCP server", func() {
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("tool \"delete_compute_instance\" returned an error result"))
 		Expect(err.Error()).To(MatchRegexp(`(?i)(not.?found|permission.?denied)`))
+		Expect(err.Error()).To(ContainSubstring(`"grpc_code":"NotFound"`))
 		stillPresent, err := computeInstancesClient.Get(ctx, publicv1.ComputeInstancesGetRequest_builder{Id: computeInstanceID}.Build())
 		Expect(err).ToNot(HaveOccurred())
 		Expect(stillPresent.GetObject().GetMetadata().HasDeletionTimestamp()).To(BeFalse())
@@ -555,7 +627,13 @@ var _ = Describe("MCP server", func() {
 				}},
 			},
 		)
-		Expect(err).To(MatchError(ContainSubstring("public API rejected the request")))
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring(`"category":"invalid_request"`))
+		Expect(err.Error()).To(ContainSubstring(`"grpc_code":"InvalidArgument"`))
+		deniedEnvelope := regexp.MustCompile(`"category":"([^"]+)".*"grpc_code":"([^"]+)"`).FindStringSubmatch(err.Error())
+		Expect(deniedEnvelope).To(HaveLen(3))
+		Expect(deniedEnvelope[1]).To(Equal("invalid_request"))
+		Expect(deniedEnvelope[2]).To(Equal("InvalidArgument"))
 		adminInstances := privatev1.NewComputeInstancesClient(tool.InternalView().AdminConn())
 		for _, name := range []string{invalidName, deniedName} {
 			invalidList, e := adminInstances.List(ctx, privatev1.ComputeInstancesListRequest_builder{
@@ -564,6 +642,23 @@ var _ = Describe("MCP server", func() {
 			Expect(e).ToNot(HaveOccurred())
 			Expect(invalidList.GetItems()).To(BeEmpty())
 		}
+
+		dispatchName := fmt.Sprintf("mcp-dispatch-compute-%s", uuid.New()[24:32])
+		_, err = callMCPTool[mcpserver.CreateComputeInstanceOutput](
+			ctx, session, "create_compute_instance", map[string]any{
+				"service":      "osac.public.v1.ComputeInstances",
+				"method":       "Delete",
+				"payload":      map[string]any{"id": computeInstanceID},
+				"name":         dispatchName,
+				"catalog_item": catalogItemID,
+			},
+		)
+		Expect(err).To(HaveOccurred())
+		dispatchList, err := adminInstances.List(ctx, privatev1.ComputeInstancesListRequest_builder{
+			Filter: proto.String(fmt.Sprintf("this.metadata.name == %q", dispatchName)),
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		Expect(dispatchList.GetItems()).To(BeEmpty())
 
 		_, err = callMCPTool[mcpserver.DeleteComputeInstanceOutput](
 			ctx, session, "delete_compute_instance", mcpserver.DeleteComputeInstanceInput{},

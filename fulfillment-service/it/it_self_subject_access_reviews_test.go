@@ -75,7 +75,7 @@ var _ = Describe("SelfSubjectAccessReview", func() {
 				}.Build(),
 				Spec: privatev1.BareMetalInstanceTypeSpec_builder{
 					Hardware: privatev1.BareMetalHardwareSpec_builder{
-						Cpu:    privatev1.BareMetalCPUSpec_builder{Cores: 32, Architecture: "x86_64", ThreadsPerCore: 2}.Build(),
+						Cpu:    privatev1.BareMetalCPUSpec_builder{Cores: 32, Architecture: "amd64", ThreadsPerCore: 2}.Build(),
 						Memory: privatev1.BareMetalMemorySpec_builder{TotalGb: 128}.Build(),
 						NetworkPorts: []*privatev1.BareMetalNetworkPortSpec{
 							privatev1.BareMetalNetworkPortSpec_builder{
@@ -136,7 +136,8 @@ var _ = Describe("SelfSubjectAccessReview", func() {
 				createResp, err := systemAdminClustersClient.Create(ctx, publicv1.ClustersCreateRequest_builder{
 					Object: publicv1.Cluster_builder{
 						Metadata: publicv1.Metadata_builder{
-							Name: clusterName,
+							Name:   clusterName,
+							Tenant: tenantName,
 						}.Build(),
 						Spec: publicv1.ClusterSpec_builder{
 							Template: publicv1.ClusterTemplateReference_builder{Id: templateID}.Build(),
@@ -480,6 +481,83 @@ var _ = Describe("SelfSubjectAccessReview", func() {
 			status, ok := grpcstatus.FromError(err)
 			Expect(ok).To(BeTrue())
 			Expect(status.Code()).To(Equal(grpccodes.Unauthenticated))
+		})
+	})
+
+	Describe("Reader permissions", func() {
+		It("allows a reader to check permissions without performing the checked operation", func() {
+			_, _ = getOrCreateTenantDefaultNetworkClassFixture(ctx)
+			readerConn, _ := createReaderRoleBindingAndConnection(ctx, "ben", "tenant-reader")
+			readerReviewClient := publicv1.NewSelfSubjectAccessReviewsClient(readerConn)
+			readerClustersClient := publicv1.NewClustersClient(readerConn)
+			clusterName := "reader-create-review-" + uuid.New()[24:]
+
+			getReview, err := readerReviewClient.Create(ctx, publicv1.SelfSubjectAccessReviewsCreateRequest_builder{
+				Object: publicv1.SelfSubjectAccessReview_builder{
+					Metadata: publicv1.Metadata_builder{Name: "reader-get-review-" + uuid.New()[24:], Tenant: "development"}.Build(),
+					Spec: publicv1.SelfSubjectAccessReviewSpec_builder{
+						Service: "osac.public.v1.Clusters",
+						Method:  "Get",
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(getReview).ToNot(BeNil())
+			Expect(getReview.GetObject()).ToNot(BeNil())
+			Expect(getReview.GetObject().GetStatus()).ToNot(BeNil())
+			Expect(getReview.GetObject().GetStatus().GetAllowed()).To(BeTrue())
+
+			createReview, err := readerReviewClient.Create(ctx, publicv1.SelfSubjectAccessReviewsCreateRequest_builder{
+				Object: publicv1.SelfSubjectAccessReview_builder{
+					Metadata: publicv1.Metadata_builder{Name: clusterName, Tenant: "development"}.Build(),
+					Spec: publicv1.SelfSubjectAccessReviewSpec_builder{
+						Service: "osac.public.v1.Clusters",
+						Method:  "Create",
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(createReview).ToNot(BeNil())
+			Expect(createReview.GetObject()).ToNot(BeNil())
+			Expect(createReview.GetObject().GetStatus()).ToNot(BeNil())
+			Expect(createReview.GetObject().GetStatus().GetAllowed()).To(BeFalse())
+
+			adminClient := publicv1.NewClustersClient(tool.InternalView().AdminConn())
+			filter := fmt.Sprintf("this.metadata.name == %q", clusterName)
+			listed, err := adminClient.List(ctx, publicv1.ClustersListRequest_builder{Filter: &filter}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(listed.GetItems()).To(BeEmpty())
+
+			createResponse, err := readerClustersClient.Create(ctx, publicv1.ClustersCreateRequest_builder{
+				Object: publicv1.Cluster_builder{
+					Metadata: publicv1.Metadata_builder{Name: clusterName, Tenant: "development"}.Build(),
+					Spec: publicv1.ClusterSpec_builder{
+						Template: publicv1.ClusterTemplateReference_builder{Id: templateID}.Build(),
+						NodeSets: testClusterNodeSets(instanceTypeID, 3),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			if err == nil {
+				Expect(createResponse).ToNot(BeNil())
+				Expect(createResponse.GetObject()).ToNot(BeNil())
+				deferClusterDeletion(createResponse.GetObject().GetId(), tool.InternalView().AdminConn())
+			}
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.PermissionDenied))
+			listed, err = adminClient.List(ctx, publicv1.ClustersListRequest_builder{Filter: &filter}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(listed.GetItems()).To(BeEmpty())
+
+			anonymousClient := publicv1.NewSelfSubjectAccessReviewsClient(tool.ExternalView().AnonymousConn())
+			_, err = anonymousClient.Create(ctx, publicv1.SelfSubjectAccessReviewsCreateRequest_builder{
+				Object: publicv1.SelfSubjectAccessReview_builder{
+					Metadata: publicv1.Metadata_builder{Name: "reader-anonymous-review-" + uuid.New()[24:], Tenant: "development"}.Build(),
+					Spec: publicv1.SelfSubjectAccessReviewSpec_builder{
+						Service: "osac.public.v1.Clusters",
+						Method:  "Create",
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.Unauthenticated))
 		})
 	})
 

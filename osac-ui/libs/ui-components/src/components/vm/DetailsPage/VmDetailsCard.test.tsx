@@ -48,7 +48,10 @@ const catalogVm: ComputeInstance = {
       storageTier: create(StorageTierReferenceSchema, { name: 'balanced' }),
     },
     userData: '#cloud-config',
-    additionalDisks: [],
+    additionalDisks: {
+      $typeName: 'osac.public.v1.ComputeInstanceDiskList',
+      items: [],
+    },
     networkAttachments: [],
     template: create(ComputeInstanceTemplateReferenceSchema, { id: '' }),
     templateParameters: {},
@@ -69,13 +72,11 @@ describe('VmDetailsCard', () => {
     expect(screen.getByText('web-01')).toBeInTheDocument();
     expect(screen.getByText('tenant-ssh-key')).toBeInTheDocument();
     expect(screen.getByText('40 GB, balanced')).toBeInTheDocument();
-    expect(screen.getByText('alice')).toBeInTheDocument();
     expect(screen.queryByText('User Data')).not.toBeInTheDocument();
     expect(screen.queryByText('Run strategy')).not.toBeInTheDocument();
     expect(screen.queryByText('Tenants')).not.toBeInTheDocument();
     expect(screen.queryByText('Version')).not.toBeInTheDocument();
-    expect(screen.queryByText('Creators')).not.toBeInTheDocument();
-    expect(screen.getByText('Creator')).toBeInTheDocument();
+    expect(screen.queryByText('Creator')).not.toBeInTheDocument();
   });
 
   it('still shows spec fields when catalog item is missing', () => {
@@ -97,20 +98,22 @@ describe('VmDetailsCard', () => {
       ...catalogVm,
       spec: {
         ...catalogVm.spec,
-        additionalDisks: [
-          {
-            $typeName: 'osac.public.v1.ComputeInstanceDisk',
-            sizeGib: 100,
-            storageTier: create(StorageTierReferenceSchema, { name: 'fast' }),
-          },
-          {
-            $typeName: 'osac.public.v1.ComputeInstanceDisk',
-            sizeGib: 20,
-            storageTier: create(StorageTierReferenceSchema, { name: 'legacy-tier' }),
-          },
-        ],
+        additionalDisks: {
+          items: [
+            {
+              $typeName: 'osac.public.v1.ComputeInstanceDisk',
+              sizeGib: 100,
+              storageTier: create(StorageTierReferenceSchema, { name: 'fast' }),
+            },
+            {
+              $typeName: 'osac.public.v1.ComputeInstanceDisk',
+              sizeGib: 20,
+              storageTier: create(StorageTierReferenceSchema, { name: 'legacy-tier' }),
+            },
+          ],
+        },
       },
-    } as unknown as ComputeInstance;
+    } as ComputeInstance;
 
     renderCard(vmWithAdditionalDisks);
 

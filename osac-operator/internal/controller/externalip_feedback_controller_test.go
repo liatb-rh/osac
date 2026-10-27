@@ -21,6 +21,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -29,6 +30,8 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -149,6 +152,49 @@ var _ = Describe("ExternalIPFeedbackController", func() {
 			updated := &v1alpha1.ExternalIP{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: publicIPName, Namespace: publicIPNamespace}, updated)).To(Succeed())
 			Expect(controllerutil.ContainsFinalizer(updated, osacExternalIPFeedbackFinalizer)).To(BeTrue())
+		})
+
+		It("should not move a deleting Fulfillment ExternalIP back to Pending", func() {
+			publicIP := &privatev1.ExternalIP{
+				Id: publicIPID,
+				Metadata: &privatev1.Metadata{
+					Name: publicIPName,
+				},
+				Spec: &privatev1.ExternalIPSpec{
+					Pool: testPoolRef,
+				},
+				Status: &privatev1.ExternalIPStatus{
+					State: privatev1.ExternalIPState_EXTERNAL_IP_STATE_DELETING,
+				},
+			}
+			mockServer.addExternalIP(publicIP)
+
+			cr := &v1alpha1.ExternalIP{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      publicIPName,
+					Namespace: publicIPNamespace,
+					Labels: map[string]string{
+						osacExternalIPIDLabel: publicIPID,
+					},
+				},
+				Spec: v1alpha1.ExternalIPSpec{
+					Pool: testPool,
+				},
+				Status: v1alpha1.ExternalIPStatus{
+					Phase: v1alpha1.ExternalIPPhaseProgressing,
+					State: v1alpha1.ExternalIPStatePending,
+				},
+			}
+			Expect(k8sClient.Create(ctx, cr)).To(Succeed())
+
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      publicIPName,
+					Namespace: publicIPNamespace,
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(mockServer.updates).To(BeEmpty())
 		})
 
 		It("should sync State=Allocated to database state=ALLOCATED", func() {
@@ -678,6 +724,70 @@ var _ = Describe("ExternalIPFeedbackController", func() {
 
 			Expect(mockServer.updates).To(BeEmpty())
 		})
+	})
+})
+
+var _ = Describe("syncExternalIPDelete", func() {
+	It("dates a failed address's report at the CR's recorded transition time", func() {
+		remote := &privatev1.ExternalIP{Id: "externalip-del-failed", Status: &privatev1.ExternalIPStatus{}}
+		recorded := metav1.NewTime(time.Unix(1000, 0))
+		deletedAt := metav1.NewTime(time.Unix(2000, 0))
+		cr := &v1alpha1.ExternalIP{
+			ObjectMeta: metav1.ObjectMeta{DeletionTimestamp: &deletedAt},
+			Status:     v1alpha1.ExternalIPStatus{State: v1alpha1.ExternalIPStateFailed, StateTransitionTime: &recorded},
+		}
+
+		Expect(syncExternalIPDelete(context.Background(), cr, remote)).To(Succeed())
+
+		Expect(remote.GetStatus().GetStateTransitionTime().AsTime().Equal(recorded.Time)).To(BeTrue())
+	})
+
+	It("dates the forced DELETING of a pre-deletion state at the deletion timestamp", func() {
+		// The recorded time dates the Allocated state, not the deletion: reporting
+		// DELETING at it would end billing at the Allocated time and erase the span
+		// up to the deletion.
+		remote := &privatev1.ExternalIP{Id: "externalip-del-allocated", Status: &privatev1.ExternalIPStatus{}}
+		recorded := metav1.NewTime(time.Unix(1000, 0))
+		deletedAt := metav1.NewTime(time.Unix(2000, 0))
+		cr := &v1alpha1.ExternalIP{
+			ObjectMeta: metav1.ObjectMeta{DeletionTimestamp: &deletedAt},
+			Status:     v1alpha1.ExternalIPStatus{State: v1alpha1.ExternalIPStateAllocated, StateTransitionTime: &recorded},
+		}
+
+		Expect(syncExternalIPDelete(context.Background(), cr, remote)).To(Succeed())
+
+		Expect(remote.GetStatus().GetStateTransitionTime().AsTime().Equal(deletedAt.Time)).To(BeTrue())
+	})
+
+	It("dates the change at the deletion timestamp when the CR status carries no time", func() {
+		remote := &privatev1.ExternalIP{Id: "externalip-del-fallback", Status: &privatev1.ExternalIPStatus{}}
+		deletedAt := metav1.NewTime(time.Unix(2000, 0))
+		cr := &v1alpha1.ExternalIP{
+			ObjectMeta: metav1.ObjectMeta{DeletionTimestamp: &deletedAt},
+			Status:     v1alpha1.ExternalIPStatus{State: v1alpha1.ExternalIPStateAllocated},
+		}
+
+		Expect(syncExternalIPDelete(context.Background(), cr, remote)).To(Succeed())
+
+		Expect(remote.GetStatus().GetStateTransitionTime().AsTime().Equal(deletedAt.Time)).To(BeTrue())
+	})
+
+	It("keeps the remote's stored time when neither the CR nor its deletion carries one", func() {
+		remote := &privatev1.ExternalIP{Id: "externalip-del-remote", Status: &privatev1.ExternalIPStatus{}}
+		original := timestamppb.Now()
+		remote.GetStatus().SetStateTransitionTime(original)
+
+		Expect(syncExternalIPDelete(context.Background(), &v1alpha1.ExternalIP{}, remote)).To(Succeed())
+
+		Expect(proto.Equal(remote.GetStatus().GetStateTransitionTime(), original)).To(BeTrue())
+	})
+
+	It("rejects an address with no time anywhere", func() {
+		remote := &privatev1.ExternalIP{Id: "externalip-del-none", Status: &privatev1.ExternalIPStatus{}}
+
+		Expect(syncExternalIPDelete(context.Background(), &v1alpha1.ExternalIP{}, remote)).To(
+			MatchError(ContainSubstring("no state transition time")),
+		)
 	})
 })
 

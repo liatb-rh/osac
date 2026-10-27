@@ -188,6 +188,14 @@ func (r *ComputeInstanceReconciler) updateStatusWithRetry(ctx context.Context, k
 		}
 		// Copy status updates to the latest version
 		latest.Status = newStatus
+		if !latest.DeletionTimestamp.IsZero() {
+			// Provisioning can finish after the API has accepted deletion. Keep
+			// the provider job history for cleanup, but don't publish stale
+			// Running/Ready state over the deletion state.
+			latest.Status.Phase = v1alpha1.ComputeInstancePhaseDeleting
+			latest.SetStatusCondition(v1alpha1.ComputeInstanceConditionReady, metav1.ConditionFalse,
+				"ComputeInstance is being deleted", v1alpha1.ReasonDeleting)
+		}
 		// Attempt to update with fresh resourceVersion
 		return r.Status().Update(ctx, latest)
 	})
@@ -646,16 +654,27 @@ func (r *ComputeInstanceReconciler) handleDelete(ctx context.Context, _ reconcil
 	log := ctrllog.FromContext(ctx)
 	log.Info("deleting compute instance")
 
+	// The outer Reconcile persists status after handleDelete returns. Keep the
+	// base finalizer until a later reconcile observes that status in the API.
+	oldStatus := instance.Status.DeepCopy()
 	setComputeInstancePhase(&instance.Status, v1alpha1.ComputeInstancePhaseDeleting)
+	instance.SetStatusCondition(v1alpha1.ComputeInstanceConditionReady, metav1.ConditionFalse,
+		"ComputeInstance is being deleted", v1alpha1.ReasonDeleting)
 
 	// Base finalizer has already been removed, cleanup complete
 	if !controllerutil.ContainsFinalizer(instance, osacComputeInstanceFinalizer) {
 		return ctrl.Result{}, nil
 	}
 
+	done, result, err := reconcileAutoExternalIPCleanup(ctx, r.Client, r.NetworkingNamespace,
+		autoExternalIPOwner{kind: computeInstanceOwner, id: instance.Labels[osacComputeInstanceIDLabel]}, r.StatusPollInterval)
+	if err != nil || !done {
+		return result, err
+	}
+
 	// Handle deprovisioning - provider decides internally if needed
 	log.Info("handling deletion")
-	result, err := r.handleDeprovisioning(ctx, instance)
+	result, err = r.handleDeprovisioning(ctx, instance)
 	if err != nil {
 		return result, err
 	}
@@ -663,6 +682,10 @@ func (r *ComputeInstanceReconciler) handleDelete(ctx context.Context, _ reconcil
 	// If we need to requeue (jobs still running or provider needs time), do so
 	if result.RequeueAfter > 0 {
 		return result, nil
+	}
+
+	if !equality.Semantic.DeepEqual(instance.Status, *oldStatus) {
+		return ctrl.Result{RequeueAfter: r.StatusPollInterval}, nil
 	}
 
 	// Deprovisioning complete or skipped, remove base finalizer
@@ -1067,12 +1090,14 @@ func (r *ComputeInstanceReconciler) handleDesiredConfigVersion(ctx context.Conte
 	return nil
 }
 
-// recordRunningConfig records the desired config version that is actually running, with the
-// time of that observation, so the running instance type can be billed from when it started
-// running rather than from when the change was reported downstream. The version is recorded
-// once per configuration: while it is unchanged the recorded time stays put. The instance
-// type name is part of the recorded identity: two types with identical resources hash to the
-// same config version, and a resize between them must still move the stamp.
+// recordRunningConfig records the desired config version that is actually running, so the
+// running instance type can be billed from when it started running rather than from when
+// the change was reported downstream. The stamp follows configRunningSince: the first
+// record dates from the phase change, a change of the recorded version or type name from
+// the observation. The version is recorded once per configuration: while it is unchanged
+// the recorded time stays put. The instance type name is part of the recorded identity:
+// two types with identical resources hash to the same config version, and a resize
+// between them must still move the stamp.
 //
 // The record is the CR-side half of crConfirmsRunningType: recording establishes the name and
 // time that the predicate later vouches with. A pending restart invalidates any earlier
@@ -1104,10 +1129,41 @@ func recordRunningConfig(instance *v1alpha1.ComputeInstance) {
 	if !instance.IsStatusConditionTrue(v1alpha1.ComputeInstanceConditionConfigurationApplied) {
 		return
 	}
-	since := metav1.NewTime(time.Now().UTC())
+	// The stamp depends on what is being recorded: the first record of the
+	// resource dates from the phase change, a change of the recorded version or
+	// type name from this observation. See configRunningSince.
+	since := configRunningSince(instance)
 	instance.Status.RunningConfigVersion = instance.Status.DesiredConfigVersion
 	instance.Status.RunningInstanceTypeName = label
 	instance.Status.RunningConfigSince = &since
+}
+
+// configRunningSince returns when the recorded config started running.
+//
+// The first record of a resource, when no version was recorded before, stamps the
+// RUNNING phase transition: the type is known from the spec at admission and is
+// what the VM booted with, so the record must date from the moment the instance
+// started running rather than from when the provisioning job completed and the
+// ConfigurationApplied condition turned true, up to tens of seconds later. A VM
+// stopped in that window would otherwise keep the gap permanently unbilled under
+// the instance_type dimension. A missing phase time falls back to the observation
+// time.
+//
+// A change of the recorded version or type name stamps the observation time. The
+// condition time cannot be reused: a name-only resize between types with
+// identical resources leaves the condition untouched, so its transition time is
+// arbitrarily stale and would backdate the new type, moving the usage between the
+// two pricing dimensions. The observation time cannot backdate and lags the
+// change by at most one reconcile, a bound the condition-time rule also had since
+// the condition was itself set at observation.
+func configRunningSince(instance *v1alpha1.ComputeInstance) metav1.Time {
+	if instance.Status.RunningConfigVersion == "" {
+		if !instance.Status.PhaseTransitionTime.IsZero() {
+			return *instance.Status.PhaseTransitionTime
+		}
+		return metav1.Now()
+	}
+	return metav1.Now()
 }
 
 // crConfirmsRunningType reports whether the CR confirms that the requested instance type is

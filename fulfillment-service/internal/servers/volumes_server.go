@@ -121,6 +121,9 @@ func (b *VolumesServerBuilder) Build() (result *VolumesServer, err error) {
 	inMapper, err := NewGenericMapper[*publicv1.Volume, *privatev1.Volume]().
 		SetLogger(b.logger).
 		SetStrict(true).
+		// The status is output-only, and the metering trigger guards only its tracked
+		// fields: a caller-supplied status.message must never reach the database.
+		AddIgnoredFields("osac.public.v1.Volume.status").
 		Build()
 	if err != nil {
 		return
@@ -262,7 +265,7 @@ func (s *VolumesServer) Create(ctx context.Context,
 			"Failed to map public volume to private",
 			slog.Any("error", err),
 		)
-		err = grpcstatus.Errorf(grpccodes.Internal, "failed to process volume")
+		err = publicInputMappingError(err, "failed to process volume")
 		return
 	}
 	// The status is output-only: only the system writes it. The metering source contract
@@ -304,6 +307,11 @@ func (s *VolumesServer) Create(ctx context.Context,
 // the private server regardless of state.
 func (s *VolumesServer) Update(ctx context.Context,
 	request *publicv1.VolumesUpdateRequest) (response *publicv1.VolumesUpdateResponse, err error) {
+	ctx = withPublicAPIView(ctx)
+	if err := validatePublicObjectMetadata(request.GetObject()); err != nil {
+		return nil, err
+	}
+
 	// Validate the request:
 	publicVolume := request.GetObject()
 	if publicVolume == nil {
@@ -357,7 +365,7 @@ func (s *VolumesServer) Update(ctx context.Context,
 			"Failed to map public volume to private",
 			slog.Any("error", err),
 		)
-		err = grpcstatus.Errorf(grpccodes.Internal, "failed to process volume")
+		err = publicInputMappingError(err, "failed to process volume")
 		return
 	}
 	privateVolume.SetStatus(storedStatus)

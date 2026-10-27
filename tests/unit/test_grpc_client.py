@@ -69,6 +69,29 @@ def test_create_compute_instance_with_disk_image_includes_security_group(monkeyp
     ]
 
 
+def test_create_external_ip_sets_project_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = GRPCClient(address="fulfillment-api.example.test:443", token="test-token")
+    calls: list[dict[str, Any]] = []
+
+    def capture_call(*, service: str, data: dict[str, Any] | None = None) -> dict[str, Any]:
+        calls.append({"service": service, "data": data})
+        return {"object": {"id": "external-ip-id"}}
+
+    monkeypatch.setattr(client, "call", capture_call)
+
+    result = client.create_external_ip(name="e2e-ip", pool="pool-id", project="billing")
+
+    assert result == "external-ip-id"
+    assert calls == [
+        {
+            "service": "osac.public.v1.ExternalIPs/Create",
+            "data": {
+                "object": {"metadata": {"name": "e2e-ip", "project": "billing"}, "spec": {"pool": {"id": "pool-id"}}}
+            },
+        }
+    ]
+
+
 def test_create_and_delete_shared_baremetal_instance_type(monkeypatch: pytest.MonkeyPatch) -> None:
     client = GRPCClient(address="fulfillment-api.example.test:443", token="test-token")
     calls: list[dict[str, Any]] = []
@@ -93,7 +116,7 @@ def test_create_and_delete_shared_baremetal_instance_type(monkeypatch: pytest.Mo
                     "metadata": {"name": "e2e-bmi-type", "tenant": "shared"},
                     "spec": {
                         "hardware": {
-                            "cpu": {"cores": 4, "architecture": "x86_64", "threads_per_core": 2},
+                            "cpu": {"cores": 4, "architecture": "amd64", "threads_per_core": 2},
                             "memory": {"total_gb": 8},
                             "network_ports": [
                                 {"name": "data-0", "role": "fabric", "type": "Ethernet", "speed": "10Gbps"}
